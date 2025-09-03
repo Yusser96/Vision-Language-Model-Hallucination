@@ -29,6 +29,7 @@ import argparse
 import csv
 from pathlib import Path
 from typing import List, Set, Tuple
+import json
 
 import pandas as pd
 import spacy
@@ -57,20 +58,22 @@ def normalize_for_set(doc) -> Set[str]:
     }
 
 
-def hallucinated_tokens(doc_llm, support_lemmas: Set[str]) -> Tuple[List[str], List[str]]:
+def hallucinated_tokens(doc_llm, support_lemmas: Set[str]) -> Tuple[List[str], List[str], List[str]]:
     """
     Find LLM tokens that are NOUN/PROPN/ADJ whose lemma isn't in the support set.
     Returns (surface_forms, lemmas).
     """
     flagged: List[str] = []
     flagged_lemmas: List[str] = []
+    all_tokens: List[str] = []
     for tok in doc_llm:
         if tok.pos_ in CONTENT_POS and (tok.is_alpha or tok.pos_ == "NUM"):
             lemma = tok.lemma_.lower()
             if lemma not in support_lemmas:
                 flagged.append(tok.text)
                 flagged_lemmas.append(lemma)
-    return flagged, flagged_lemmas
+            all_tokens.append(lemma)
+    return flagged, flagged_lemmas, all_tokens
 
 
 def hallucinated_noun_chunks(doc_llm, support_lemmas: Set[str], threshold: float) -> List[str]:
@@ -115,6 +118,12 @@ def parse_args() -> argparse.Namespace:
         "-o", "--output",
         type=Path,
         default=Path("./hallucination_report.csv"),
+        help="Output CSV path (default: ./hallucination_report.csv).",
+    )
+    parser.add_argument(
+        "-o-jsonl", "--output-jsonl",
+        type=Path,
+        default=Path("./hallucination_report.jsonl"),
         help="Output CSV path (default: ./hallucination_report.csv).",
     )
     parser.add_argument(
@@ -176,7 +185,9 @@ def main() -> None:
 
         doc_llm = nlp(llm_text)
 
-        flagged_tokens, flagged_lemmas = hallucinated_tokens(doc_llm, support)
+        flagged_tokens, flagged_lemmas, content_tokens = hallucinated_tokens(doc_llm, support)
+
+        _, _, ref_content_tokens = hallucinated_tokens(doc_ref, support)
         flagged_chunks = hallucinated_noun_chunks(doc_llm, support, args.chunk_threshold)
 
         rows.append(
@@ -191,8 +202,24 @@ def main() -> None:
                 "num_flagged_chunks": len(set(flagged_chunks)),
                 "llm_len_tokens": sum(1 for t in doc_llm if not t.is_space),
                 "support_vocab_size": len(support),
+                "content_tokens":content_tokens,
+                "support":support,
+                "flagged_lemmas":flagged_lemmas,
+                "ref_content_tokens":ref_content_tokens
             }
         )
+
+    out_path = Path(args.output_jsonl) if args.output_jsonl else None
+    out_f = out_path.open("w", encoding="utf-8") if out_path else None
+    if out_f:
+        for row in rows:
+            #print(rec)
+            Sentence_CHAIR_I = 0
+            if row["content_tokens"]:
+                Sentence_CHAIR_I = len(row["flagged_lemmas"])/len(row["content_tokens"])
+            rec = {"idx": row["sample_id"]+1, "pred": row["llm_output"].strip(), "refs": [row["reference"].strip()], "pred_objs": list(row["content_tokens"]), "ref_objs": list(row["ref_content_tokens"]), "hallucinated": list(row["flagged_lemmas"]), "Sentence_CHAIR_I": Sentence_CHAIR_I}
+            out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        out_f.close()
 
     df = pd.DataFrame(rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)
